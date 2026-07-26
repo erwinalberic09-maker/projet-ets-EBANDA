@@ -1,0 +1,1209 @@
+import { ChangeDetectionStrategy, Component, inject, signal, computed, OnInit, DestroyRef } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { ReactiveFormsModule, FormGroup, FormControl, FormArray, Validators, AbstractControl } from '@angular/forms';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+import { CahierService } from '../../../core/services/cahier.service';
+import { AuthService } from '../../../core/services/auth.service';
+import { PdfExportService } from '../../../core/services/pdf-export.service';
+import { DocxExportService } from '../../../core/services/docx-export.service';
+import { ExcelExportService } from '../../../core/services/excel-export.service';
+import { Operation, MonthlySummary, OperationItem, WorkWeek, OPERATION_TYPES } from '../../../shared/models/cahier.model';
+
+interface OperationFormValue {
+  site?: string;
+  type?: string;
+  date?: string;
+  heure?: string;
+  quantite?: number | null;
+  produit?: string | null;
+  destination?: string | null;
+  sonLevel?: string | null;
+  frequence?: string | null;
+  details?: string | null;
+  items?: Partial<OperationItem>[];
+}
+
+@Component({
+  selector: 'app-cahier',
+  imports: [CommonModule, ReactiveFormsModule],
+  templateUrl: './cahier.component.html',
+  styleUrl: './cahier.component.scss',
+  changeDetection: ChangeDetectionStrategy.OnPush
+})
+export class CahierComponent implements OnInit {
+  readonly cahierService = inject(CahierService);
+  readonly authService = inject(AuthService);
+  private readonly pdfService = inject(PdfExportService);
+  private readonly docxService = inject(DocxExportService);
+  private readonly excelService = inject(ExcelExportService);
+  private readonly destroyRef = inject(DestroyRef);
+
+  // UI state signals
+  readonly isCreationPageOpen = signal<boolean>(false);
+  readonly currentStep = signal<number>(1); // Step 1: Site, Step 2: Type, Step 3: Form & Table
+  readonly selectedSummaryKeys = signal<{ month: string; site: string } | null>(null);
+  readonly isSaving = signal<boolean>(false);
+  readonly operationToDelete = signal<string | null>(null);
+  readonly validationBlockMessage = signal<string | null>(null);
+  readonly validationBlockTitle = signal<string>('Saisie bloquée');
+  readonly detailGroupingMode = signal<'week' | 'type'>('week');
+
+  // Date de début choisie par l'utilisateur pour démarrer une nouvelle semaine, par site
+  readonly newWeekStartDates = signal<Record<string, string>>({});
+
+  readonly visibleSites = computed<string[]>(() => {
+    const user = this.authService.currentUser();
+    if (user?.role === 'admin') {
+      return ['SCMC', 'TUSCANI', 'AFISA', 'AUTRE'];
+    }
+
+    const assignedSite = user?.assignedSiteName?.trim();
+    return assignedSite ? [assignedSite] : [];
+  });
+
+  readonly activeWeeksBySite = computed(() => {
+    const weeks = this.cahierService.weeks();
+    const result: Record<string, WorkWeek> = {};
+    this.visibleSites().forEach(site => {
+      const active = weeks.find(w => w.site === site && !w.is_closed);
+      if (active) {
+        result[site] = active;
+      }
+    });
+    return result;
+  });
+
+  readonly dateValidationWarning = computed(() => {
+    const val = this.formValue();
+    if (!val.site || !val.date) return null;
+    return this.cahierService.validateOperationDate(val.site, val.date);
+  });
+
+  readonly visibleOperations = computed<Operation[]>(() => {
+    const isAdmin = this.authService.currentUser()?.role === 'admin';
+    const visibleSites = this.visibleSites();
+
+    return this.cahierService.operations().filter(op => {
+      if (!op) return false;
+      if (!isAdmin && visibleSites.length > 0 && !visibleSites.includes(op.site || '')) return false;
+      return true;
+    });
+  });
+
+  readonly visibleDrafts = computed(() => {
+    const isAdmin = this.authService.currentUser()?.role === 'admin';
+    const visibleSites = this.visibleSites();
+
+    return this.cahierService.drafts().filter(draft => {
+      if (!draft) return false;
+      if (!isAdmin && visibleSites.length > 0 && !visibleSites.includes(draft.site || '')) return false;
+      return true;
+    });
+  });
+
+  readonly visibleMonthlySummaries = computed(() => {
+    const isAdmin = this.authService.currentUser()?.role === 'admin';
+    const visibleSites = this.visibleSites();
+
+    return this.cahierService.monthlySummaries().filter(summary => {
+      if (!isAdmin && visibleSites.length > 0 && !visibleSites.includes(summary.site || '')) return false;
+      return true;
+    });
+  });
+
+  readonly selectedSummary = computed<MonthlySummary | null>(() => {
+    const keys = this.selectedSummaryKeys();
+    if (!keys) return null;
+
+    const filteredOps = this.visibleOperations().filter(o => {
+      if (o.isDraft) return false;
+      if (!o.date || typeof o.date !== 'string') return false;
+      const dateParts = o.date.split('-');
+      if (dateParts.length < 2) return false;
+      const year = dateParts[0];
+      const monthNum = parseInt(dateParts[1], 10);
+      const monthsFrench = [
+        'Janvier', 'Février', 'Mars', 'Avril', 'Mai', 'Juin',
+        'Juillet', 'Août', 'Septembre', 'Octobre', 'Novembre', 'Décembre'
+      ];
+      const monthFrench = monthsFrench[monthNum - 1] || 'Inconnu';
+      const key = `${monthFrench} ${year}`;
+      return key === keys.month && o.site === keys.site;
+    });
+
+    if (filteredOps.length === 0) {
+      return null;
+    }
+
+    return {
+      month: keys.month,
+      site: keys.site,
+      type: '',
+      count: filteredOps.length,
+      operations: filteredOps
+    };
+  });
+
+  readonly activeDraftId = signal<string | null>(null);
+  readonly globalDnPrefix = signal<string>('DN');
+  readonly isEditingRegistered = signal<boolean>(false);
+
+  // Available options
+  readonly operationTypes = OPERATION_TYPES;
+
+  private getOperationTypesForSite(site: string): string[] {
+    if (site === 'TUSCANI') {
+      return ['Chargement Camions'];
+    }
+    if (site === 'AUTRE') {
+      return ['Chargement Wagon Blé', 'Chargement Wagon Farine', 'Reconditionnement', 'Nettoyage'];
+    }
+    return ['Chargement', 'Déchargement', 'Surmontage', 'Transfert', 'Son'];
+  }
+
+  private getUsedOperationTypesForSite(site: string): Set<string> {
+    const activeWeek = this.cahierService.getActiveWeek(site);
+    const relevantOperations = this.cahierService.operations().filter(op => {
+      if (!op?.site || op.site !== site || !op.type) {
+        return false;
+      }
+
+      if (op.isDraft) {
+        return true;
+      }
+
+      if (!activeWeek) {
+        return false;
+      }
+
+      const opDate = op.date;
+      return opDate >= activeWeek.start_date && opDate <= activeWeek.end_date;
+    });
+
+    return new Set(relevantOperations.map(op => op.type));
+  }
+
+  readonly filteredOperationTypes = computed<string[]>(() => {
+    const site = this.operationForm.controls.site.value || this.formValue().site || '';
+    const visibleSites = this.visibleSites();
+    if (!site) {
+      return this.getOperationTypesForSite('');
+    }
+    if (visibleSites.length > 0 && !visibleSites.includes(site)) {
+      return [];
+    }
+
+    const availableTypes = this.getOperationTypesForSite(site);
+    const usedTypes = this.getUsedOperationTypesForSite(site);
+
+    return availableTypes.filter(type => !usedTypes.has(type));
+  });
+
+  readonly productPriceMap = new Map<string, number>([
+    ['AFRICANA 50KG', 25],
+    ['CDB', 25],
+    ['MAKHLOUT50KG', 25],
+    ['MM50KG', 25],
+    ['MM25KG', 12.5],
+    ['MM5KG', 2.5],
+    ['PRIMO', 25],
+    ['SITAL FANGASSOU 25KG', 12.5],
+    ['WAGON DE BLÉ', 200],
+    ['WAGON DE FARINE', 25],
+    ['CAMION TUSCANY', 1200]
+  ]);
+
+  readonly productSuggestions = signal<string[]>([]);
+  readonly activeProductRowRef = signal<FormGroup | null>(null);
+
+  private normalizeProductString(s: string | null | undefined): string {
+    return (s || '').toString().replace(/\s+/g, ' ').trim().toUpperCase();
+  }
+
+  private findProductMapKeyByNormalized(normalized: string): string | undefined {
+    return Array.from(this.productPriceMap.keys()).find(k => this.normalizeProductString(k) === normalized);
+  }
+  // Form group definition
+  readonly operationForm = new FormGroup({
+    site: new FormControl<string>('', { validators: [Validators.required], nonNullable: true }),
+    type: new FormControl<string>('', { validators: [Validators.required], nonNullable: true }),
+    date: new FormControl<string>('', { validators: [Validators.required], nonNullable: true }),
+    heure: new FormControl<string>('', { validators: [Validators.required], nonNullable: true }),
+    quantite: new FormControl<number | null>(null),
+    produit: new FormControl<string>(''),
+    destination: new FormControl<string>(''),
+    sonLevel: new FormControl<string>('Moyen'),
+    frequence: new FormControl<string>('Basse'),
+    details: new FormControl<string>(''),
+    items: new FormArray<FormGroup>([])
+  });
+
+  // Track active form values as a signal for instant preview (Step 3)
+  readonly formValue = signal<OperationFormValue>({});
+
+  get itemsFormArray(): FormArray {
+    return this.operationForm.get('items') as FormArray;
+  }
+
+  createItemFormGroup(date = '', dn = '', produit = '', qte: number | null = null, pu: number | null = null, montant: number | null = null): FormGroup {
+    const currentSite = this.operationForm.controls.site.value || '';
+    const currentType = this.operationForm.controls.type.value || '';
+    const isPrefixRequired = currentType === 'Chargement' && (currentSite === 'AFISA' || currentSite === 'SCMC');
+
+    let prefix = isPrefixRequired ? this.globalDnPrefix() : '';
+    let num = '';
+    if (dn) {
+      const upperDn = dn.toUpperCase().trim();
+      if (isPrefixRequired) {
+        if (upperDn.startsWith('LTI ')) {
+          prefix = 'LTI';
+          num = dn.slice(4).trim();
+        } else if (upperDn.startsWith('ISTI ')) {
+          prefix = 'ISTI';
+          num = dn.slice(5).trim();
+        } else if (upperDn.startsWith('DN ')) {
+          prefix = 'DN';
+          num = dn.slice(3).trim();
+        } else {
+          const spaceIdx = dn.indexOf(' ');
+          if (spaceIdx !== -1) {
+            const possiblePrefix = dn.slice(0, spaceIdx).toUpperCase();
+            if (['DN', 'LTI', 'ISTI'].includes(possiblePrefix)) {
+              prefix = possiblePrefix;
+              num = dn.slice(spaceIdx + 1).trim();
+            } else {
+              prefix = this.globalDnPrefix();
+              num = dn.trim();
+            }
+          } else {
+            if (upperDn.startsWith('LTI')) {
+              prefix = 'LTI';
+              num = dn.slice(3).trim();
+            } else if (upperDn.startsWith('ISTI')) {
+              prefix = 'ISTI';
+              num = dn.slice(4).trim();
+            } else if (upperDn.startsWith('DN')) {
+              prefix = 'DN';
+              num = dn.slice(2).trim();
+            } else {
+              prefix = this.globalDnPrefix();
+              num = dn.trim();
+            }
+          }
+        }
+      } else {
+        // No prefix needed. If the existing data starts with legacy "DN ", "LTI ", or "ISTI ", strip it.
+        prefix = '';
+        if (upperDn.startsWith('DN ')) {
+          num = dn.slice(3).trim();
+        } else if (upperDn.startsWith('LTI ')) {
+          num = dn.slice(4).trim();
+        } else if (upperDn.startsWith('ISTI ')) {
+          num = dn.slice(5).trim();
+        } else if (upperDn.startsWith('DN')) {
+          num = dn.slice(2).trim();
+        } else if (upperDn.startsWith('LTI')) {
+          num = dn.slice(3).trim();
+        } else if (upperDn.startsWith('ISTI')) {
+          num = dn.slice(4).trim();
+        } else {
+          num = dn.trim();
+        }
+      }
+    }
+
+    const isDnRequired = isPrefixRequired || 
+                         currentType === 'Chargement Camions' || 
+                         currentType === 'Chargement des wagons' || 
+                         currentType === 'Chargement wagons' ||
+                         currentType === 'Chargement Wagon Blé' ||
+                         currentType === 'Chargement Wagon Farine';
+    const isProduitRequired = currentType !== 'Chargement Camions';
+
+    const group = new FormGroup({
+      date: new FormControl<string>(date || this.operationForm.controls.date.value || '', { validators: [Validators.required], nonNullable: true }),
+      dnPrefix: new FormControl<string>(prefix, { validators: (isDnRequired && currentType === 'Chargement') ? [Validators.required] : [], nonNullable: true }),
+      dnNumber: new FormControl<string>(num, { validators: isDnRequired ? [Validators.required] : [], nonNullable: true }),
+      dn: new FormControl<string>(dn || (isPrefixRequired ? `${prefix} ${num}`.toUpperCase().trim() : num.toUpperCase().trim()), { validators: isDnRequired ? [Validators.required] : [], nonNullable: true }),
+      produit: new FormControl<string>(produit, { validators: isProduitRequired ? [Validators.required] : [], nonNullable: true }),
+      qte: new FormControl<number | null>(qte, { validators: [Validators.required, Validators.min(0)] }),
+      pu: new FormControl<number | null>(pu, { validators: [Validators.required, Validators.min(0)] }),
+      montant: new FormControl<number | null>(montant, { validators: [Validators.required, Validators.min(0)] })
+    });
+
+    const updateProductSuggestions = (value: string) => {
+      const query = this.normalizeProductString(value);
+      if (!query) {
+        this.productSuggestions.set([]);
+        this.activeProductRowRef.set(null);
+        return;
+      }
+
+      const suggestions = Array.from(this.productPriceMap.keys())
+        .filter(key => this.normalizeProductString(key).includes(query));
+
+      this.productSuggestions.set(suggestions.slice(0, 6));
+      this.activeProductRowRef.set(group);
+    };
+
+    const applyProductSelection = (product: string) => {
+      this.selectProductSuggestion(group, product);
+    };
+
+    group.controls['produit'].valueChanges.pipe(takeUntilDestroyed(this.destroyRef)).subscribe(value => {
+      const productValue = (value || '').toString();
+      if (productValue.trim() === '') {
+        this.productSuggestions.set([]);
+        this.activeProductRowRef.set(null);
+        return;
+      }
+
+      const normalized = this.normalizeProductString(productValue);
+      const isWagonType = ['Chargement Wagon Blé', 'Chargement Wagon Farine'].includes(currentType);
+      const isCamionTuscany = normalized === 'CAMION TUSCANY';
+
+      // Find a matching product key by normalized form
+      const matchedKey = this.findProductMapKeyByNormalized(normalized);
+
+      // Apply automatic PU for known products, except wagon types.
+      // CAMION TUSCANY is explicitly allowed for Chargement Camions.
+      if (matchedKey && (!isWagonType || isCamionTuscany)) {
+        applyProductSelection(matchedKey);
+        return;
+      }
+
+      updateProductSuggestions(productValue);
+    });
+
+    // Auto-calculate montant when qte or pu changes, and dn when prefix or number changes
+    group.valueChanges.pipe(takeUntilDestroyed(this.destroyRef)).subscribe(v => {
+      const calculatedMontant = (Number(v.qte) || 0) * (Number(v.pu) || 0);
+      let changed = false;
+      
+      if (group.controls['montant'].value !== calculatedMontant) {
+        group.controls['montant'].setValue(calculatedMontant, { emitEvent: false });
+        changed = true;
+      }
+
+      // Synchronize product/designation for Reconditionnement operations from the first row to all others
+      if (this.operationForm?.value?.type === 'Reconditionnement' && this.itemsFormArray) {
+        const firstItem = this.itemsFormArray.at(0);
+        if (firstItem && group === firstItem) {
+          const firstProduit = firstItem.get('produit')?.value || '';
+          this.itemsFormArray.controls.forEach(ctrl => {
+            if (ctrl !== firstItem && ctrl.get('produit')?.value !== firstProduit) {
+              ctrl.get('produit')?.setValue(firstProduit, { emitEvent: false });
+            }
+          });
+        }
+      }
+
+      // Dropdown selection (dnPrefix + dnNumber) should only apply to required fields
+      if (isDnRequired) {
+        const rawNum = (v.dnNumber || '').toString().trim();
+        const calculatedDn = isPrefixRequired
+          ? `${v.dnPrefix || 'DN'} ${rawNum}`.toUpperCase().trim()
+          : rawNum.toUpperCase().trim();
+        if (group.controls['dn'].value !== calculatedDn) {
+          group.controls['dn'].setValue(calculatedDn, { emitEvent: false });
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        this.operationForm.updateValueAndValidity({ emitEvent: true });
+        this.formValue.set(this.operationForm.value as OperationFormValue);
+      }
+    });
+
+    return group;
+  }
+
+  addItemRow() {
+    const opDate = this.operationForm.controls.date.value || new Date().toISOString().split('T')[0];
+    let defaultProduct = this.operationForm.controls.produit.value || '';
+    if (this.operationForm.value.type === 'Reconditionnement' && this.itemsFormArray.length > 0) {
+      defaultProduct = this.itemsFormArray.at(0).get('produit')?.value || '';
+    }
+    const group = this.createItemFormGroup(opDate, '', defaultProduct);
+    this.itemsFormArray.push(group);
+    
+    // Auto-calculate montant if they want, but let's keep direct input and listen to value changes to update signal
+    this.operationForm.updateValueAndValidity();
+    this.formValue.set(this.operationForm.value as OperationFormValue);
+  }
+
+  removeItemRow(index: number) {
+    this.itemsFormArray.removeAt(index);
+    this.operationForm.updateValueAndValidity();
+    this.formValue.set(this.operationForm.value as OperationFormValue);
+  }
+
+  selectProductSuggestion(row: number | FormGroup | AbstractControl, product: string) {
+    let group: FormGroup | null = null;
+    if (typeof row === 'number') {
+      group = this.itemsFormArray.at(row) as FormGroup | null;
+    } else if (row instanceof FormGroup) {
+      group = row as FormGroup;
+    } else {
+      // row may be an AbstractControl passed from the template; find matching FormGroup reference
+      group = this.itemsFormArray.controls.find(ctrl => ctrl === row) as FormGroup | null;
+    }
+
+    if (!group) {
+      return;
+    }
+
+    const puValue = this.productPriceMap.get(product) ?? null;
+    group.controls['produit'].setValue(product, { emitEvent: false });
+    group.controls['pu'].setValue(puValue, { emitEvent: false });
+    group.controls['montant'].setValue((Number(group.controls['qte'].value) || 0) * (Number(puValue) || 0), { emitEvent: false });
+    this.productSuggestions.set([]);
+    this.activeProductRowRef.set(null);
+    this.operationForm.updateValueAndValidity({ emitEvent: false });
+  }
+
+  onGlobalPrefixChange(newPrefix: string) {
+    this.globalDnPrefix.set(newPrefix);
+  }
+
+  ngOnInit() {
+    // Sync form changes to our formValue signal for live preview
+    this.formValue.set(this.operationForm.value as OperationFormValue);
+    this.operationForm.valueChanges
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe(val => {
+        this.formValue.set(val as OperationFormValue);
+      });
+  }
+
+  // Live preview computed signal
+  readonly livePreview = computed<Partial<Operation>>(() => {
+    const val = this.formValue();
+    return {
+      site: val.site || 'Non défini',
+      type: val.type as Operation['type'],
+      date: val.date || '',
+      heure: val.heure || '',
+      details: val.details || '',
+      items: (val.items as Partial<OperationItem>[] || []).map(item => ({
+        date: item.date || '',
+        dn: item.dn || '',
+        produit: item.produit || '',
+        qte: Number(item.qte) || 0,
+        pu: Number(item.pu) || 0,
+        montant: Number(item.montant) || 0
+      }))
+    };
+  });
+
+  // Calculate instant total of table items
+  readonly totalChargement = computed<number>(() => {
+    const val = this.formValue();
+    if (!val.items || !Array.isArray(val.items)) return 0;
+    return val.items.reduce((sum: number, item: Partial<OperationItem>) => sum + (Number(item?.montant) || 0), 0);
+  });
+
+  // Calculate instant total of quantities (Tonnage / sacs)
+  readonly totalQuantite = computed<number>(() => {
+    const val = this.formValue();
+    if (!val.items || !Array.isArray(val.items)) return 0;
+    return val.items.reduce((sum: number, item: Partial<OperationItem>) => sum + (Number(item?.qte) || 0), 0);
+  });
+
+  readonly tableColspan = computed<number>(() => {
+    const val = this.formValue();
+    if (val.type === 'Chargement des wagons' || val.type === 'Chargement wagons' || val.type === 'Chargement Wagon Blé' || val.type === 'Chargement Wagon Farine') {
+      return 6;
+    }
+    if (val.type === 'Chargement Camions') {
+      return 6;
+    }
+    const isDnActive = val.type === 'Chargement' && (val.site === 'AFISA' || val.site === 'SCMC');
+    return isDnActive ? 7 : 6;
+  });
+
+  readonly totalColspan = computed<number>(() => {
+    const val = this.formValue();
+    if (val.type === 'Chargement des wagons' || val.type === 'Chargement wagons' || val.type === 'Chargement Wagon Blé' || val.type === 'Chargement Wagon Farine') {
+      return 4;
+    }
+    if (val.type === 'Chargement Camions') {
+      return 4;
+    }
+    const isDnActive = val.type === 'Chargement' && (val.site === 'AFISA' || val.site === 'SCMC');
+    return isDnActive ? 5 : 4;
+  });
+
+  getOperationTotal(op: Operation): number {
+    if (!op || !op.items || !Array.isArray(op.items)) return 0;
+    return op.items.reduce((sum: number, item: OperationItem) => sum + (Number(item?.montant) || 0), 0);
+  }
+
+  // Opens the creation page view
+  openNewOperationModal() {
+    this.isEditingRegistered.set(false);
+    this.itemsFormArray.clear();
+    this.activeDraftId.set(null);
+
+    const currentUser = this.authService.currentUser();
+    const visibleSites = this.visibleSites();
+    const defaultSite = currentUser?.role === 'admin'
+      ? ''
+      : (visibleSites[0] || '');
+
+    this.operationForm.reset({
+      site: defaultSite,
+      type: '',
+      date: '',
+      heure: '',
+      quantite: null,
+      produit: '',
+      destination: '',
+      sonLevel: 'Moyen',
+      frequence: 'Basse',
+      details: ''
+    });
+    this.currentStep.set(1);
+    this.isCreationPageOpen.set(true);
+  }
+
+  // Opens form from an existing draft
+  editDraft(draft: Operation) {
+    this.isEditingRegistered.set(false);
+    this.itemsFormArray.clear();
+    this.activeDraftId.set(draft.id);
+    
+    this.operationForm.patchValue({
+      site: draft.site,
+      type: draft.type,
+      date: draft.date,
+      heure: draft.heure,
+      quantite: draft.quantite !== undefined ? draft.quantite : null,
+      produit: draft.produit || '',
+      destination: draft.destination || '',
+      sonLevel: draft.sonLevel || 'Moyen',
+      frequence: draft.frequence || 'Basse',
+      details: draft.details || ''
+    });
+
+    if (draft.items && draft.items.length > 0) {
+      draft.items.forEach(item => {
+        this.itemsFormArray.push(this.createItemFormGroup(
+          item.date,
+          item.dn,
+          item.produit,
+          item.qte,
+          item.pu,
+          item.montant
+        ));
+      });
+    }
+
+    this.currentStep.set(3); // Go directly to detailed stage
+    this.isCreationPageOpen.set(true);
+  }
+
+  // Opens form from an existing registered operation
+  editOperation(op: Operation) {
+    this.isEditingRegistered.set(true);
+    this.itemsFormArray.clear();
+    this.activeDraftId.set(op.id);
+    
+    this.operationForm.patchValue({
+      site: op.site,
+      type: op.type,
+      date: op.date,
+      heure: op.heure,
+      quantite: op.quantite !== undefined ? op.quantite : null,
+      produit: op.produit || '',
+      destination: op.destination || '',
+      sonLevel: op.sonLevel || 'Moyen',
+      frequence: op.frequence || 'Basse',
+      details: op.details || ''
+    });
+
+    if (op.items && op.items.length > 0) {
+      op.items.forEach(item => {
+        this.itemsFormArray.push(this.createItemFormGroup(
+          item.date,
+          item.dn,
+          item.produit,
+          item.qte,
+          item.pu,
+          item.montant
+        ));
+      });
+    } else if (op.quantite !== undefined || op.destination || op.produit) {
+      this.itemsFormArray.push(this.createItemFormGroup(
+        op.date,
+        op.destination || '',
+        op.produit || '',
+        op.quantite || 0,
+        0,
+        0
+      ));
+    }
+
+    this.currentStep.set(3); // Go directly to detailed stage
+    this.isCreationPageOpen.set(true);
+  }
+
+  // Save/Update the draft and quit the wizard
+  async saveAsDraft() {
+    if (this.isSaving()) return;
+    this.isSaving.set(true);
+    try {
+      const val = this.operationForm.getRawValue();
+      let rawItems = (val.items || []) as {
+        date?: string;
+        dnPrefix?: string;
+        dnNumber?: string;
+        dn?: string;
+        produit?: string;
+        qte?: number | null;
+        pu?: number | null;
+        montant?: number | null;
+      }[];
+
+      // Sort items if they are "Chargement" at "AFISA" or "SCMC"
+      if ((val.site === 'AFISA' || val.site === 'SCMC') && val.type === 'Chargement') {
+        rawItems = [...rawItems].sort((a, b) => {
+          const aNum = (a.dnNumber || '').trim();
+          const bNum = (b.dnNumber || '').trim();
+          return aNum.localeCompare(bNum, undefined, { numeric: true, sensitivity: 'base' });
+        });
+      }
+
+      const operationDate = rawItems.find(item => !!item.date)?.date || val.date || '';
+
+      const draftData: Partial<Operation> = {
+        id: this.activeDraftId() || undefined,
+        site: val.site || undefined,
+        type: val.type as Operation['type'] || undefined,
+        date: operationDate || undefined,
+        heure: val.heure || undefined,
+        details: val.details || undefined,
+        quantite: val.quantite !== null ? val.quantite : undefined,
+        produit: val.produit || undefined,
+        destination: val.destination || undefined,
+        sonLevel: val.sonLevel || undefined,
+        frequence: val.frequence || undefined,
+        items: rawItems.map(item => ({
+          date: item.date || val.date || '',
+          dn: item.dn || `${item.dnPrefix || 'DN'} ${item.dnNumber || ''}`.toUpperCase().trim(),
+          produit: item.produit || '',
+          qte: item.qte !== null ? Number(item.qte) : 0,
+          pu: item.pu !== null ? Number(item.pu) : 0,
+          montant: item.montant !== null ? Number(item.montant) : 0
+        }))
+      };
+
+      await this.cahierService.saveDraft(draftData);
+      this.isCreationPageOpen.set(false);
+    } catch (err: unknown) {
+      console.error(err);
+      const errMsg = err instanceof Error ? err.message : 'Une erreur est survenue lors de l\'enregistrement du brouillon.';
+      this.validationBlockTitle.set('Erreur d\'enregistrement');
+      this.validationBlockMessage.set(errMsg);
+    } finally {
+      this.isSaving.set(false);
+    }
+  }
+
+  async closeModal() {
+    if (this.isSaving()) return;
+    if (this.isEditingRegistered()) {
+      if (this.operationForm.dirty) {
+        // Si l'utilisateur a fait des modifications sur le formulaire/tableau d'une opération déjà enregistrée 
+        // mais qu'il ferme sans enregistrer les modifications, le tableau repart automatiquement en brouillon.
+        await this.saveAsDraft();
+        return;
+      }
+      this.isCreationPageOpen.set(false);
+      return;
+    }
+
+    // Check if the table has actual data filled in
+    const hasTableData = this.itemsFormArray.controls.some(group => {
+      const v = group.value;
+      return (v.produit && v.produit.trim() !== '') || 
+             (v.qte !== null && Number(v.qte) > 0) || 
+             (v.pu !== null && Number(v.pu) > 0) ||
+             (v.dnNumber && v.dnNumber.trim() !== '');
+    });
+    
+    if (hasTableData) {
+      await this.saveAsDraft();
+      return;
+    }
+    
+    this.isCreationPageOpen.set(false);
+  }
+
+  // Auto-selection triggers transition
+  selectSite(siteOption: string) {
+    const visibleSites = this.visibleSites();
+    if (visibleSites.length > 0 && !visibleSites.includes(siteOption)) {
+      return;
+    }
+
+    this.operationForm.patchValue({ site: siteOption });
+    const currentType = this.operationForm.controls.type.value;
+    const allowedTypes = this.filteredOperationTypes();
+    if (currentType && !allowedTypes.includes(currentType)) {
+      this.operationForm.patchValue({ type: '' });
+    }
+
+    const relevantOperations = this.cahierService.operations().filter(op => {
+      if (!op?.site || op.site !== siteOption || !op.type) {
+        return false;
+      }
+
+      const activeWeek = this.cahierService.getActiveWeek(siteOption);
+      if (op.isDraft) {
+        return true;
+      }
+
+      if (!activeWeek) {
+        return false;
+      }
+
+      return op.date >= activeWeek.start_date && op.date <= activeWeek.end_date;
+    });
+
+    if (relevantOperations.length > 0 && allowedTypes.length === 0) {
+      const existingOperation = relevantOperations[0];
+      if (existingOperation.isDraft) {
+        this.editDraft(existingOperation);
+      } else {
+        this.editOperation(existingOperation);
+      }
+      return;
+    }
+
+    this.goToStep2();
+  }
+
+  selectType(typeOption: string) {
+    this.operationForm.patchValue({ type: typeOption });
+    if (typeOption === 'Chargement Wagon Blé') {
+      this.operationForm.patchValue({ produit: 'Blé' });
+      this.goToStep3();
+    } else if (typeOption === 'Chargement Wagon Farine') {
+      this.operationForm.patchValue({ produit: 'Farine' });
+      this.goToStep3();
+    } else if (typeOption !== 'Chargement des wagons' && typeOption !== 'Chargement wagons') {
+      this.goToStep3();
+    }
+  }
+
+  selectWagonProduct(product: string) {
+    this.operationForm.patchValue({ produit: product });
+    this.goToStep3();
+  }
+
+  // Transitions to Step 2 if Site is valid
+  goToStep2() {
+    const siteCtrl = this.operationForm.controls.site;
+    siteCtrl.markAsTouched();
+    if (siteCtrl.valid) {
+      this.currentStep.set(2);
+    }
+  }
+
+  // Transitions to Step 3 if Type is valid
+  goToStep3() {
+    const typeCtrl = this.operationForm.controls.type;
+    typeCtrl.markAsTouched();
+    if (typeCtrl.valid) {
+      // Clear legacy validators for separate fields
+      this.operationForm.controls.quantite.clearValidators();
+      this.operationForm.controls.produit.clearValidators();
+      this.operationForm.controls.destination.clearValidators();
+
+      this.operationForm.controls.quantite.updateValueAndValidity();
+      this.operationForm.controls.produit.updateValueAndValidity();
+      this.operationForm.controls.destination.updateValueAndValidity();
+
+      // Ensure at least one line is present when opening the step 3 form
+      if (this.itemsFormArray.length === 0) {
+        const opDate = this.operationForm.controls.date.value || new Date().toISOString().split('T')[0];
+        const defaultProduct = this.operationForm.controls.produit.value || '';
+        this.itemsFormArray.push(this.createItemFormGroup(opDate, '', defaultProduct));
+      }
+
+      this.currentStep.set(3);
+    }
+  }
+
+  canSubmitOperation(): boolean {
+    const formValue = this.operationForm.getRawValue();
+    const hasSiteAndType = !!formValue.site && !!formValue.type;
+
+    if (!hasSiteAndType) {
+      return false;
+    }
+
+    const hasItems = (formValue.items || []).some(item => {
+      const hasContent = !!((item as Partial<OperationItem> | undefined)?.produit || (item as Partial<OperationItem> | undefined)?.qte || (item as Partial<OperationItem> | undefined)?.pu || (item as Partial<OperationItem> | undefined)?.montant || (item as Partial<OperationItem> | undefined)?.dn);
+      return hasContent;
+    });
+
+    return hasItems || this.itemsFormArray.length === 0;
+  }
+
+  // Submits the newly created operation
+  async onSubmit() {
+    if (this.isSaving()) return;
+    if (!this.canSubmitOperation()) {
+      this.operationForm.markAllAsTouched();
+      return;
+    }
+
+    const val = this.operationForm.getRawValue();
+
+    let rawItems = (val.items || []) as {
+      date?: string;
+      dnPrefix?: string;
+      dnNumber?: string;
+      dn?: string;
+      produit?: string;
+      qte?: number | null;
+      pu?: number | null;
+      montant?: number | null;
+    }[];
+
+    const dateCandidates = rawItems
+      .map(item => (item.date || '').toString().trim())
+      .filter(Boolean);
+
+    const operationDate = dateCandidates[0] || (val.date || '').toString().trim();
+    const validation = operationDate
+      ? this.cahierService.validateOperationDate(val.site, operationDate)
+      : { allowed: false, reason: 'Veuillez saisir une date d’opération.' };
+
+    if (!validation.allowed) {
+      this.validationBlockTitle.set('Saisie bloquée');
+      this.validationBlockMessage.set(validation.reason || 'La date saisie n’est pas autorisée pour la semaine active.');
+      return;
+    }
+
+    this.isSaving.set(true);
+    try {
+
+      // Sort items if they are "Chargement" at "AFISA" or "SCMC"
+      if ((val.site === 'AFISA' || val.site === 'SCMC') && val.type === 'Chargement') {
+        rawItems = [...rawItems].sort((a, b) => {
+          const aNum = (a.dnNumber || '').trim();
+          const bNum = (b.dnNumber || '').trim();
+          return aNum.localeCompare(bNum, undefined, { numeric: true, sensitivity: 'base' });
+        });
+      }
+
+      const opData: Omit<Operation, 'id' | 'collaborateur'> & { id?: string } = {
+        id: this.activeDraftId() || undefined,
+        site: val.site,
+        type: val.type as Operation['type'],
+        date: operationDate,
+        heure: val.heure,
+        details: val.details || undefined,
+        items: rawItems.map(item => ({
+          date: item.date || '',
+          dn: item.dn || `${item.dnPrefix || 'DN'} ${item.dnNumber || ''}`.toUpperCase().trim(),
+          produit: item.produit || '',
+          qte: Number(item.qte) || 0,
+          pu: Number(item.pu) || 0,
+          montant: Number(item.montant) || 0
+        }))
+      };
+
+      await this.cahierService.addOperation(opData);
+      this.isCreationPageOpen.set(false); // Close directly, bypassing dirty closeModal check
+    } catch (err: unknown) {
+      console.error(err);
+      const errMsg = err instanceof Error ? err.message : 'Une erreur est survenue lors de l\'enregistrement.';
+      this.validationBlockTitle.set('Erreur d\'enregistrement');
+      this.validationBlockMessage.set(errMsg);
+    } finally {
+      this.isSaving.set(false);
+    }
+  }
+
+  // Deletes an operation with local confirmation
+  deleteOp(id: string) {
+    this.operationToDelete.set(id);
+  }
+
+  // Confirms the deletion of an operation
+  async confirmDelete() {
+    const id = this.operationToDelete();
+    if (id) {
+      this.isSaving.set(true);
+      try {
+        const success = await this.cahierService.deleteOperation(id);
+        if (!success) {
+          this.validationBlockTitle.set('Erreur de suppression');
+          this.validationBlockMessage.set('La suppression a échoué. L\'opération est toujours présente.');
+        }
+      } finally {
+        this.isSaving.set(false);
+        this.operationToDelete.set(null);
+      }
+    }
+  }
+
+  // Cancels delete operation
+  cancelDelete() {
+    this.operationToDelete.set(null);
+  }
+
+  // Exports an operation to PDF format using the PDF export service
+  exportToPdf(op: Operation) {
+    this.pdfService.exportOperationToPdf(op);
+  }
+
+  // Exports an operation to DOCX format using the DOCX export service
+  exportToDocx(op: Operation) {
+    this.docxService.exportOperationToDocx(op);
+  }
+
+  // Exports an operation to Excel format using the Excel export service
+  exportToExcel(op: Operation) {
+    this.excelService.exportOperationToExcel(op);
+  }
+
+  // Handles dropdown action selection
+  onActionChange(event: Event, op: Operation) {
+    const selectElement = event.target as HTMLSelectElement;
+    const value = selectElement.value;
+    if (!value) return;
+
+    switch (value) {
+      case 'edit':
+        this.editOperation(op);
+        break;
+      case 'delete':
+        this.deleteOp(op.id);
+        break;
+      case 'excel':
+        this.exportToExcel(op);
+        break;
+      case 'pdf':
+        this.exportToPdf(op);
+        break;
+      case 'docx':
+        this.exportToDocx(op);
+        break;
+    }
+
+    // Reset select back to placeholder
+    selectElement.value = '';
+  }
+
+  // Exports the active monthly summary to DOCX format using the DOCX export service
+  exportMonthlyToDocx() {
+    const summary = this.selectedSummary();
+    if (summary) {
+      this.docxService.exportMonthlySummaryToDocx(summary);
+    }
+  }
+
+  // Exports the active monthly summary to Excel format using the Excel export service
+  exportMonthlyToExcel() {
+    const summary = this.selectedSummary();
+    if (summary) {
+      this.excelService.exportMonthlySummaryToExcel(summary);
+    }
+  }
+
+  // Set detailed summary view
+  showDetail(summary: MonthlySummary) {
+    this.selectedSummaryKeys.set({
+      month: summary.month,
+      site: summary.site
+    });
+  }
+
+  // Clear detailed summary and return to main monthly table
+  backToMonthly() {
+    this.selectedSummaryKeys.set(null);
+  }
+
+  canCloseWeek(week: WorkWeek | undefined | null): boolean {
+    if (!week) return false;
+    const today = new Date().toISOString().split('T')[0];
+    return today >= week.end_date;
+  }
+
+  async closeWeek(weekId: string) {
+    this.isSaving.set(true);
+    try {
+      await this.cahierService.closeWeek(weekId);
+    } finally {
+      this.isSaving.set(false);
+    }
+  }
+
+  // Retourne la date choisie par l'utilisateur pour démarrer la semaine du site
+  getNewWeekStartDate(site: string): string {
+    return this.newWeekStartDates()[site] || '';
+  }
+
+  onNewWeekStartDateChange(site: string, value: string) {
+    this.newWeekStartDates.update(dates => ({ ...dates, [site]: value }));
+  }
+
+  // Démarre manuellement une nouvelle semaine de travail pour un site à la date choisie
+  async startWeek(site: string) {
+    const startDate = this.getNewWeekStartDate(site);
+    this.isSaving.set(true);
+    try {
+      await this.cahierService.createWeek(site, startDate);
+    } catch (err) {
+      this.validationBlockMessage.set(err instanceof Error ? err.message : 'Erreur lors du démarrage de la semaine.');
+    } finally {
+      this.isSaving.set(false);
+    }
+  }
+
+  formatDateFr(dateStr: string): string {
+    if (!dateStr) return '';
+    const parts = dateStr.split('-');
+    if (parts.length !== 3) return dateStr;
+    return `${parts[2]}/${parts[1]}/${parts[0]}`;
+  }
+
+  readonly detailedWeekGroups = computed(() => {
+    const summary = this.selectedSummary();
+    if (!summary) return [];
+
+    const ops = [...summary.operations];
+    const weeks = this.cahierService.weeks();
+
+    const weekMap = new Map<string, WorkWeek>();
+    weeks.forEach(w => weekMap.set(w.id, w));
+
+    const groups: Record<string, { week?: WorkWeek; ops: Operation[]; label: string; start_date: string }> = {};
+
+    ops.forEach(op => {
+      let weekId = op.week_id;
+      let week = weekId ? weekMap.get(weekId) : undefined;
+
+      if (week && (!op.site || op.date < week.start_date || op.date > week.end_date)) {
+        week = undefined;
+        weekId = undefined;
+      }
+
+      if (!week && op.site) {
+        week = weeks.find(w => w.site === op.site && op.date >= w.start_date && op.date <= w.end_date);
+        weekId = week?.id;
+      }
+
+      const key = weekId || 'no-week';
+      if (!groups[key]) {
+        let label = 'Hors semaine / Non assigné';
+        let start_date = op.date;
+        if (week) {
+          const status = week.is_closed ? 'Clôturée' : 'En cours';
+          label = `Semaine du ${this.formatDateFr(week.start_date)} au ${this.formatDateFr(week.end_date)} (${status})`;
+          start_date = week.start_date;
+        }
+        groups[key] = {
+          week,
+          ops: [],
+          label,
+          start_date
+        };
+      }
+      groups[key].ops.push(op);
+    });
+
+    return Object.values(groups).sort((a, b) => b.start_date.localeCompare(a.start_date));
+  });
+
+  // Groups operations by type for the detailed view, sorted by chronological order of their first entry (saisie)
+  readonly detailedTypeGroups = computed(() => {
+    const summary = this.selectedSummary();
+    if (!summary) return [];
+
+    const ops = [...summary.operations];
+
+    // Helper to get sortable ISO time string from operation date and time
+    const getOpTime = (op: Operation) => {
+      const date = op.date || '';
+      const heure = op.heure || '00:00';
+      return `${date}T${heure}`;
+    };
+
+    // Group by operation type and product
+    const groups: Record<string, Operation[]> = {};
+    ops.forEach(op => {
+      const type = op.type;
+      const product = op.produit || '';
+      const key = product ? `${type}|${product}` : type;
+      
+      if (!groups[key]) {
+        groups[key] = [];
+      }
+      groups[key].push(op);
+    });
+
+    // Sort groups based on the oldest (earliest) operation date/time in each group
+    const sortedKeys = Object.keys(groups).sort((keyA, keyB) => {
+      const opsA = groups[keyA];
+      const opsB = groups[keyB];
+
+      const earliestA = opsA.reduce((earliest, curr) => {
+        return getOpTime(curr) < getOpTime(earliest) ? curr : earliest;
+      }, opsA[0]);
+
+      const earliestB = opsB.reduce((earliest, curr) => {
+        return getOpTime(curr) < getOpTime(earliest) ? curr : earliest;
+      }, opsB[0]);
+
+      return getOpTime(earliestA).localeCompare(getOpTime(earliestB));
+    });
+
+    return sortedKeys.map(key => {
+      // Sort operations inside this group chronologically descending (newest first for readability)
+      const sortedOps = groups[key].sort((a, b) => {
+        return getOpTime(b).localeCompare(getOpTime(a));
+      });
+
+      // The key is "Type|Product" or just "Type"
+      const [type, product] = key.includes('|') ? key.split('|') : [key, ''];
+
+      return {
+        type,
+        product,
+        ops: sortedOps
+      };
+    });
+  });
+
+  getGroupTotalQte(ops: Operation[]): number {
+    let total = 0;
+    ops.forEach(op => {
+      if (op && op.items && Array.isArray(op.items)) {
+        op.items.forEach(item => {
+          total += Number(item.qte) || 0;
+        });
+      }
+    });
+    return total;
+  }
+
+  getGroupTotalMontant(ops: Operation[]): number {
+    let total = 0;
+    ops.forEach(op => {
+      if (op && op.items && Array.isArray(op.items)) {
+        op.items.forEach(item => {
+          total += Number(item.montant) || 0;
+        });
+      }
+    });
+    return total;
+  }
+
+}

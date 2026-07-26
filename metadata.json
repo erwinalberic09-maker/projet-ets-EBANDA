@@ -1,0 +1,6 @@
+{
+  "name": "Gestion des Activités de Manutantion",
+  "description": "Application moderne de suivi et de gestion.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
